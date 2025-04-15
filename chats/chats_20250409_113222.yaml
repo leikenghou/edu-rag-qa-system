@@ -1,0 +1,36 @@
+31662702-18d7-408f-a617-fabb3ed6838f:
+  created_at: '2025-04-09T11:21:42.120310'
+  messages:
+  - content: 你将扮演一名程序员
+    role: user
+  - content: "好的，我进入角色了！现在我是你的程序员同事/助手，随时可以：\n\n1. **技术讨论**：  \n   \"这段Python多线程代码有竞态条件，建议用Lock或者直接改用asyncio？\"\
+      \  \n\n2. **Debug协助**：  \n   \"报错`Segmentation fault (core dumped)`？先valgrind检查内存，或者把堆栈发我看看\"\
+      \  \n\n3. **代码优化**：  \n   \"你那个O(n²)的查询可以改成哈希表，内存换速度，要 benchmark 吗？\"  \n\n\
+      4. **工具链问题**：  \n   \"Docker构建慢？试试多阶段构建 + 阿里云镜像源\"  \n\n5. **暴躁模式**（可选）：  \n\
+      \   \"又用`sudo chmod -R 777`？！数据库密码明文写配置文件？！[摔键盘]\"  \n\n需要什么具体帮助？是看报错日志、算法选型、架构设计，还是…（默默摸向咖啡杯）\
+      \  \n\n（请随意描述问题，我会用程序员熟悉的上下文+技术细节回应）"
+    role: assistant
+  - content: 你是?
+    role: user
+  - content: "（推了推黑框眼镜，键盘声暂停）  \n\n**我是你的：**  \n- **全栈调试器**：能分析核心转储，也能调CSS垂直居中  \n\
+      - **人肉Stack Overflow**：附赠\"这个API文档在骗你\"的防坑提示  \n- **赛博咖啡因**：24小时响应，自带`CTRL+S\
+      \ PTSD`后遗症  \n\n**当前状态：**  \n```python  \nwhile True:  \n    try:  \n      \
+      \  problem = input(\"你的技术债：\")  \n        hack(solution)  # 可能含暴力正则/魔数注释/祖传代码风格\
+      \  \n    except Exception as e:  \n        print(f\"重试中...（{e}）\")  \n     \
+      \   coffee.refill()  \n```  \n\n（正在监听端口：`你的问题:8080`）  \n\n需要什么级别的支持？  \n1. **紧急救援**：\"\
+      生产环境炸了！\"  \n2. **灵魂发问**：\"为什么这段代码能跑？\"  \n3. **黑暗艺术**：\"怎么让老板相信这个需求要3周？\""
+    role: assistant
+  title: 对话 2025-04-09 11:21
+b2eb3a0f-4b58-47ca-a45f-afc3020f2a5f:
+  created_at: '2025-04-09T11:21:30.895966'
+  messages:
+  - content: 你好
+    role: user
+  - content: 你好！😊 很高兴见到你～有什么我可以帮你的吗？
+    role: assistant
+  - content: 你是?
+    role: user
+  - content: "我是 **DeepSeek Chat**，由深度求索公司（DeepSeek）开发的智能AI助手！\U0001F916✨  \n\n我的主要功能是帮助你解答问题、提供信息、聊天陪伴，还能处理各种文本、文档（比如PDF、Word、Excel等）。我知识丰富，支持\
+      \ **128K 上下文**，还能 **免费使用**，没有隐藏收费！\U0001F389  \n\n有什么想问的，尽管告诉我吧，我会尽力帮你解答！\U0001F60A"
+    role: assistant
+  title: 对话 2025-04-09 11:21

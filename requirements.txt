@@ -1,0 +1,10 @@
+# 核心依賴
+openai
+python-dotenv
+pyyaml
+pymilvus
+dotenv
+langchain
+sentence-transformers
+transformers
+torch
