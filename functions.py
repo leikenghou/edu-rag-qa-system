@@ -5,7 +5,7 @@ import yaml
 import os
 from openai import OpenAI
 from dotenv import load_dotenv
-
+import chromadb
 
 # ==================== 环境变量 ====================
 # 加载环境变量
@@ -23,6 +23,27 @@ if api_key is None or base_url is None:
 
 # 初始化客户端
 client = OpenAI(api_key=api_key, base_url=base_url)
+chroma_client = chromadb.Client()
+
+# 初始化变量
+user_query = ""
+
+collection = chroma_client.create_collection(name="my_collection")
+
+results = collection.query(
+    query_texts=[user_query],
+    n_results=4
+)
+
+system_prompt = """
+你是一个有用的助手。
+但您只能基于我提供的知识进行回答。不使用内部知识，也不编造信息。
+如果不知道答案，请直接说：我不知道
+--------------------
+知识:
+"""+str(results['documents'])+"""
+"""
+
 
 # ==================== 工具函数 ====================
 def init_session_state():
@@ -166,6 +187,17 @@ def load_chats_from_file(file_path):
         if "chats" not in st.session_state or not st.session_state.chats:
             create_new_chat()
         return False
+
+
+def generate_rag_response():
+    response = client.chat.completions.create(
+    model="gpt-4o",
+    messages = [
+        {"role":"system","content":system_prompt},
+        {"role":"user","content":user_query}    
+    ])
+    return response
+
 
 
 def generate_ai_response(model_name="deepseek-chat", temperature=0.7):

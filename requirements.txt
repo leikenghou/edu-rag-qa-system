@@ -1,4 +1,6 @@
 # 核心依賴
+numpy==1.26.4
+scipy
 openai
 python-dotenv
 pyyaml
@@ -8,3 +10,10 @@ langchain
 sentence-transformers
 transformers
 torch
+torchvision 
+torchaudio
+docx
+bs4
+unicodedata
+pdfplumber
+chromadb
