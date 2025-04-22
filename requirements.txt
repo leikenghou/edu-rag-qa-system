@@ -4,6 +4,7 @@ scipy
 openai
 python-dotenv
 pyyaml
+pypdf
 pymilvus
 dotenv
 langchain
@@ -15,5 +16,4 @@ torchaudio
 docx
 bs4
 unicodedata
-pdfplumber
 chromadb

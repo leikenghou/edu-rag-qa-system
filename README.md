@@ -13,3 +13,6 @@ https://luxiangdong.com/2024/02/25/multilang/
 
 RAG 系统高效检索提升秘籍：如何精准选择 BGE 智源、GTE 阿里与 Jina 等的嵌入与精排模型的完美搭配
 https://zhuanlan.zhihu.com/p/7357681980
+
+embedding测试
+https://github.com/JovenChu/embedding_model_test
