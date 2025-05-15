@@ -1,19 +1,4 @@
-# 核心依賴
-numpy==1.26.4
-scipy
-openai
-python-dotenv
-pyyaml
-pypdf
-pymilvus
-dotenv
-langchain
-sentence-transformers
-transformers
-torch
-torchvision 
-torchaudio
-docx
-bs4
-unicodedata
-chromadb
+streamlit~=1.45.1
+dotenv~=0.9.9
+python-dotenv~=1.1.0
+langchain~=0.3.25

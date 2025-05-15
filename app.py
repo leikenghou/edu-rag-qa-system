@@ -1,340 +1,482 @@
 import os
-import streamlit as st
-import uuid
+import logging
+import hashlib
 import shutil
-import glob
-import functools
-from pdf_split_embeded import BGE_M3_Processor
+import tempfile
+from datetime import datetime
+from typing import Optional, List, Dict, Any
+from langchain_core.documents import Document
+import streamlit as st
+from dotenv import load_dotenv
+from langchain_community.chat_models import ChatOpenAI
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
+from langchain_core.output_parsers import StrOutputParser
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.retrievers import BM25Retriever
+from langchain.retrievers import EnsembleRetriever
+from sentence_transformers import SentenceTransformer
 
-# ==================== 初始化函数 ====================
-def init_session_state():
-    """初始化会话状态"""
-    if "chats" not in st.session_state:
-        st.session_state.chats = {}
-        create_new_chat()
-    
-    # PDF处理相关状态
-    if "pdf_processor" not in st.session_state:
-        st.session_state.pdf_processor = BGE_M3_Processor(
-            pdf_folder="./pdf_files",
-            db_path="chroma_db_bge_m3",
-            processed_dir="processed_pdfs"
-        )
-    if "pdf_processing" not in st.session_state:
-        st.session_state.pdf_processing = False
-    if "message_sent" not in st.session_state:
-        st.session_state.message_sent = False
+# ==================== 配置常量 ====================
+CHUNK_SIZE = 500
+CHUNK_OVERLAP = 50
+VECTOR_SEARCH_K = 5
+BM25_SEARCH_K = 5
+DEFAULT_VECTOR_WEIGHT = 0.5
+PAGE_SIZE = 5
+VECTOR_STORE_DIR = "./chroma_db"  # 修改为更明确的目录名
 
-def create_new_chat():
-    """创建新聊天"""
-    chat_id = str(uuid.uuid4())
-    st.session_state.chats[chat_id] = {
-        "id": chat_id,
-        "title": f"新对话-{len(st.session_state.chats)+1}",
-        "created_at": st.session_state.get("current_time", ""),
-        "messages": []
+# ==================== 初始化设置 ====================
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# 绕过 Streamlit/PyTorch 错误
+os.environ["STREAMLIT_SERVER_FILE_WATCHER_TYPE"] = "none"
+
+# 加载环境变量
+load_dotenv()
+deepseek_api_key = os.getenv("API_KEY")
+base_url = "https://api.deepseek.com"
+
+
+# ==================== Session State 初始化 ====================
+def initialize_session_state():
+    """确保所有需要的 session state 变量都已初始化"""
+    required_states = {
+        "processed_files": set(),
+        "all_docs": [],
+        "bm25_retriever": None,
+        "ensemble_retriever": None,
+        "vector_weight": DEFAULT_VECTOR_WEIGHT,
+        "vectorstore": None,
+        "embeddings": None,
+        "retrieval_mode": "混合检索",
+        "last_refresh_time": None,
+        "current_page": 1,
+        "last_question": "",
+        "last_answer": "",
+        "last_context": []
     }
-    st.session_state.current_chat_id = chat_id
 
-def delete_chat(chat_id):
-    """删除指定聊天"""
-    if chat_id in st.session_state.chats:
-        del st.session_state.chats[chat_id]
-        if st.session_state.current_chat_id == chat_id:
-            create_new_chat()
+    for key, default_value in required_states.items():
+        if key not in st.session_state:
+            st.session_state[key] = default_value
 
-def clear_current_chat():
-    """清空当前聊天"""
-    if st.session_state.current_chat_id in st.session_state.chats:
-        st.session_state.chats[st.session_state.current_chat_id]["messages"] = []
 
-def save_uploaded_files(uploaded_files, save_dir):
-    """保存上传的文件到指定目录"""
-    filepaths = []
-    os.makedirs(save_dir, exist_ok=True)
-    for uploaded_file in uploaded_files:
-        try:
-            file_path = os.path.join(save_dir, uploaded_file.name)
-            with open(file_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
-            filepaths.append(file_path)
-        except Exception as e:
-            st.error(f"保存文件 {uploaded_file.name} 失败: {str(e)}")
-    return filepaths
+# 初始化session state
+initialize_session_state()
 
-# ==================== 装饰器 ====================
-def check_pdf_processing_status(func):
-    """检查PDF处理状态的装饰器"""
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        if st.session_state.get("pdf_processing", False):
-            st.warning("PDF文件正在处理中，请稍候...")
-            return
-        return func(*args, **kwargs)
-    return wrapper
 
-# ==================== 聊天相关函数 ====================
-@check_pdf_processing_status
-def handle_send():
-    """处理用户发送消息"""
-    user_input = st.session_state.get("user_input_area", "").strip()
-    if user_input:
-        st.session_state.message_sent = True
-        st.session_state.user_input_text = user_input
-        st.session_state.user_input_area = ""  # 清空输入框
-
-def generate_ai_response(model_name: str, temperature: float):
-    """生成AI响应"""
-    current_chat = st.session_state.chats[st.session_state.current_chat_id]
-    messages = current_chat["messages"]
-    
-    # 从知识库获取相关内容
+# ==================== 模型初始化 ====================
+@st.cache_resource
+def initialize_models():
+    """初始化语言模型和嵌入模型"""
     try:
-        collection = st.session_state.pdf_processor.client.get_collection(
-            name="bge_m3_docs",
-            embedding_function=st.session_state.pdf_processor.embedding_function
+        # 初始化语言模型
+        llm = ChatOpenAI(
+            model="deepseek-chat",
+            openai_api_key=deepseek_api_key,
+            base_url=base_url,
+            temperature=0.7
         )
-        
-        if collection.count() > 0:
-            user_query = messages[-1]["content"]
-            results = st.session_state.pdf_processor.query(
-                query_text=user_query,
-                n_results=3
-            )
-            
-            if results["documents"]:
-                context_prompt = "根据以下知识库内容回答问题:\n\n"
-                for i, (doc, meta) in enumerate(zip(results["documents"][0], results["metadatas"][0])):
-                    context_prompt += f"\n相关文档 {i+1} (来自 {meta['source_file']} 第{meta['page']}页):\n{doc[:300]}...\n"
-                
-                messages.append({
-                    "role": "system",
-                    "content": context_prompt
-                })
-    except Exception as e:
-        st.error(f"知识库查询失败: {str(e)}")
-    
-    # 模拟AI响应（实际应替换为您的AI模型调用）
-    ai_response = "这是模拟的AI回答。实际应用中应替换为真实的AI模型生成的回答。"
-    
-    # 添加AI响应到聊天记录
-    messages.append({
-        "role": "assistant",
-        "content": ai_response
-    })
-    
-    # 更新聊天标题（如果是新对话的第一个问题）
-    if len(messages) == 2:  # 用户消息 + AI响应
-        current_chat["title"] = messages[0]["content"][:30] + "..."
 
-# ==================== Streamlit UI ====================
-st.set_page_config(
-    page_title="RAG智能问答系统",
-    page_icon="🎓",
-    layout="wide"
+        # 初始化嵌入模型
+        model_name = "BAAI/bge-m3"
+        embeddings = HuggingFaceEmbeddings(
+            model_name=model_name,
+            model_kwargs={"device": "cpu"},
+            encode_kwargs={"normalize_embeddings": True}
+        )
+
+        return llm, embeddings
+    except Exception as e:
+        logger.error(f"模型初始化失败: {str(e)}")
+        st.error(f"模型初始化失败: {str(e)}")
+        st.stop()
+
+
+# ==================== 向量数据库初始化 ====================
+@st.cache_resource
+def initialize_vectorstore(_embeddings, persist_directory=VECTOR_STORE_DIR):
+    """初始化或重建向量数据库"""
+    try:
+        # 确保目录存在
+        os.makedirs(persist_directory, exist_ok=True)
+
+        # 检查是否已有数据库
+        collection_files = [
+            "chroma-collections.parquet",
+            "chroma-embeddings.parquet"
+        ]
+        db_exists = all(os.path.exists(os.path.join(persist_directory, f)) for f in collection_files)
+
+        # 初始化向量数据库
+        vectorstore = Chroma(
+            persist_directory=persist_directory,
+            embedding_function=_embeddings
+        )
+
+        # 初始化session state中的文档列表
+        if len(st.session_state.all_docs) == 0 and db_exists:
+            try:
+                # 从数据库加载已有文档
+                db_content = vectorstore.get()
+                if db_content and "documents" in db_content and len(db_content["documents"]) > 0:
+                    st.session_state.all_docs = [
+                        Document(
+                            page_content=doc,
+                            metadata=db_content["metadatas"][i] if "metadatas" in db_content else {}
+                        )
+                        for i, doc in enumerate(db_content["documents"])
+                    ]
+                    logger.info(f"从数据库加载了 {len(st.session_state.all_docs)} 个文档片段")
+
+                    # 初始化已处理文件集合
+                    for doc in st.session_state.all_docs:
+                        if "source" in doc.metadata:
+                            file_hash = hashlib.md5(doc.metadata["source"].encode()).hexdigest()
+                            st.session_state.processed_files.add(file_hash)
+            except Exception as e:
+                logger.warning(f"加载已有文档失败: {str(e)}")
+
+        return vectorstore
+    except Exception as e:
+        logger.error(f"向量数据库初始化失败: {str(e)}")
+        st.error(f"向量数据库初始化失败: {str(e)}")
+        st.stop()
+
+
+# 初始化所有组件
+try:
+    llm, embeddings = initialize_models()
+    vectorstore = initialize_vectorstore(embeddings)
+    st.session_state.vectorstore = vectorstore
+    st.session_state.embeddings = embeddings
+
+    # 初始化BM25检索器
+    if len(st.session_state.all_docs) > 0:
+        st.session_state.bm25_retriever = BM25Retriever.from_documents(
+            st.session_state.all_docs
+        )
+        st.session_state.bm25_retriever.k = BM25_SEARCH_K
+except Exception as e:
+    st.error("系统初始化失败，请检查错误信息并刷新页面")
+    st.stop()
+
+# ==================== 检索系统设置 ====================
+vector_retriever = vectorstore.as_retriever(search_kwargs={"k": VECTOR_SEARCH_K})
+
+# 提示模板
+prompt_template = """
+你是一个知识问答助手。根据以下检索到的上下文回答用户的问题，回答要简洁、准确。如果上下文不足以回答，说明无法回答并建议用户提供更多信息。接着使用deepseek的知识进行回答（需要明确指出）。
+
+**上下文**：
+{context}
+
+**问题**：
+{question}
+
+**回答**：
+"""
+prompt = PromptTemplate.from_template(prompt_template)
+
+
+# ==================== 检索器逻辑 ====================
+def get_retriever(_=None):
+    """根据当前设置返回适当的检索器"""
+    initialize_session_state()
+
+    retrieval_mode = st.session_state.retrieval_mode
+    vector_weight = st.session_state.vector_weight
+
+    if retrieval_mode == "仅向量检索":
+        return vector_retriever
+
+    if retrieval_mode == "仅关键字检索(BM25)":
+        if st.session_state.bm25_retriever is None and st.session_state.all_docs:
+            try:
+                st.session_state.bm25_retriever = BM25Retriever.from_documents(
+                    st.session_state.all_docs
+                )
+                st.session_state.bm25_retriever.k = BM25_SEARCH_K
+            except Exception as e:
+                logger.error(f"创建BM25检索器失败: {str(e)}")
+                return vector_retriever
+        return st.session_state.bm25_retriever or vector_retriever
+
+    # 混合检索模式
+    if st.session_state.bm25_retriever is None and st.session_state.all_docs:
+        try:
+            st.session_state.bm25_retriever = BM25Retriever.from_documents(
+                st.session_state.all_docs
+            )
+            st.session_state.bm25_retriever.k = BM25_SEARCH_K
+        except Exception as e:
+            logger.error(f"创建BM25检索器失败: {str(e)}")
+            return vector_retriever
+
+    if st.session_state.bm25_retriever:
+        return EnsembleRetriever(
+            retrievers=[vector_retriever, st.session_state.bm25_retriever],
+            weights=[vector_weight, 1.0 - vector_weight]
+        )
+    return vector_retriever
+
+
+# ==================== RAG 链 ====================
+def format_docs(docs):
+    """将文档列表格式化为字符串"""
+    return "\n".join(doc.page_content for doc in docs)
+
+# 修改后的RAG链
+rag_chain = (
+    {
+        "context": RunnableLambda(get_retriever) | RunnableLambda(format_docs),
+        "question": RunnablePassthrough()
+    }
+    | prompt
+    | llm
+    | StrOutputParser()
 )
 
-# 初始化会话状态
-init_session_state()
 
-# 主标题
-st.title("RAG智能问答系统")
+# ==================== PDF 处理函数 ====================
+def process_pdf_file(uploaded_file):
+    """处理上传的 PDF 文件并更新知识库"""
+    tmp_file_path = None
+    try:
+        # 计算文件哈希
+        file_content = uploaded_file.read()
+        file_hash = hashlib.md5(file_content).hexdigest()
+        uploaded_file.seek(0)
 
-# ==================== 侧边栏 ====================
-with st.sidebar:
-    st.header("对话管理")
-    
-    # 显示对话列表
-    chat_ids_sorted = sorted(
-        st.session_state.chats.keys(),
-        key=lambda x: st.session_state.chats[x]["created_at"],
-        reverse=True
-    )
-    
-    for chat_id in chat_ids_sorted:
-        chat = st.session_state.chats[chat_id]
-        col1, col2 = st.columns([4, 1])
-        with col1:
-            button_label = chat["title"]
-            if chat_id == st.session_state.current_chat_id:
-                button_label = f"🔍 {button_label}"
-            
-            if st.button(button_label, key=f"chat_{chat_id}", use_container_width=True):
-                st.session_state.current_chat_id = chat_id
+        # 检查是否已处理
+        if file_hash in st.session_state.processed_files:
+            st.warning("此 PDF 文件已上传并处理，跳过重复嵌入。")
+            return
+
+        # 保存到临时文件
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            tmp_file.write(file_content)
+            tmp_file_path = tmp_file.name
+
+        # 加载和验证 PDF
+        loader = PyPDFLoader(tmp_file_path)
+        documents = loader.load()
+
+        if not documents or not any(doc.page_content.strip() for doc in documents):
+            raise ValueError("PDF 文件内容为空或不可读！")
+
+        # 分割文本
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP
+        )
+        splits = text_splitter.split_documents(documents)
+
+        # 为每个片段添加源文件信息
+        for split in splits:
+            split.metadata["source"] = uploaded_file.name
+
+        # 更新向量数据库 (Chroma会自动持久化)
+        st.session_state.vectorstore.add_documents(splits)
+
+        # 更新内存中的文档列表
+        st.session_state.all_docs.extend(splits)
+        st.session_state.processed_files.add(file_hash)
+
+        # 重建 BM25 检索器
+        try:
+            st.session_state.bm25_retriever = BM25Retriever.from_documents(
+                st.session_state.all_docs
+            )
+            st.session_state.bm25_retriever.k = BM25_SEARCH_K
+        except Exception as e:
+            logger.error(f"更新BM25检索器失败: {str(e)}")
+
+        st.session_state.last_refresh_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        st.success(f"成功处理 {uploaded_file.name}！新增 {len(splits)} 个文档片段。")
+    except Exception as e:
+        logger.error(f"处理 PDF 文件时出错: {str(e)}")
+        st.error(f"处理 PDF 文件时出错: {str(e)}")
+    finally:
+        if tmp_file_path and os.path.exists(tmp_file_path):
+            os.unlink(tmp_file_path)
+
+
+# ==================== 侧边栏知识库查看 ====================
+def knowledge_base_sidebar():
+    """侧边栏知识库查看功能"""
+    with st.sidebar:
+        st.header("📚 知识库管理")
+
+        # 独立刷新按钮
+        if st.button("🔄 刷新知识库", use_container_width=True, help="从磁盘重新加载所有内容"):
+            try:
+                # 重新初始化向量数据库
+                st.session_state.vectorstore = Chroma(
+                    persist_directory=VECTOR_STORE_DIR,
+                    embedding_function=st.session_state.embeddings
+                )
+
+                # 重新加载文档
+                db_content = st.session_state.vectorstore.get()
+                st.session_state.all_docs = [
+                    Document(
+                        page_content=doc,
+                        metadata=db_content["metadatas"][i] if "metadatas" in db_content else {}
+                    )
+                    for i, doc in enumerate(db_content["documents"])
+                ] if "documents" in db_content else []
+
+                # 重建已处理文件集合
+                st.session_state.processed_files = set()
+                for doc in st.session_state.all_docs:
+                    if "source" in doc.metadata:
+                        file_hash = hashlib.md5(doc.metadata["source"].encode()).hexdigest()
+                        st.session_state.processed_files.add(file_hash)
+
+                # 重建BM25检索器
+                if len(st.session_state.all_docs) > 0:
+                    st.session_state.bm25_retriever = BM25Retriever.from_documents(
+                        st.session_state.all_docs
+                    )
+                    st.session_state.bm25_retriever.k = BM25_SEARCH_K
+
+                st.session_state.last_refresh_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 st.rerun()
-        
-        with col2:
-            if st.button("🗑", key=f"delete_{chat_id}"):
-                delete_chat(chat_id)
-                st.rerun()
-    
-    if st.button("➕ 新建对话", use_container_width=True):
-        create_new_chat()
-        st.rerun()
-    
-    st.divider()
-    
-    # ==================== 知识库管理 ====================
-    st.header("知识库管理")
-    
-    # PDF上传和处理
-    uploaded_files = st.file_uploader(
-        "上传PDF文件", 
-        type=["pdf"], 
-        accept_multiple_files=True,
-        key="pdf_uploader"
-    )
-    
-    # 处理参数
-    with st.expander("处理参数"):
+            except Exception as e:
+                st.error(f"刷新知识库失败: {str(e)}")
+
+        if st.session_state.last_refresh_time:
+            st.caption(f"最后刷新: {st.session_state.last_refresh_time}")
+
+        # 知识库统计信息
+        st.divider()
+        st.markdown(f"**文档片段总数**: {len(st.session_state.all_docs)}")
+        st.markdown(f"**已处理文件数**: {len(st.session_state.processed_files)}")
+
+        # 分页控制
+        st.divider()
+        total_pages = max(1, (len(st.session_state.all_docs) + PAGE_SIZE - 1) // PAGE_SIZE)
+        st.session_state.current_page = st.number_input(
+            "页码",
+            min_value=1,
+            max_value=total_pages,
+            value=st.session_state.current_page,
+            key="kb_page_input"
+        )
+
+        # 文档显示
+        st.divider()
+        if not st.session_state.all_docs:
+            st.info("知识库为空，请上传PDF文件")
+            return
+
+        start_idx = (st.session_state.current_page - 1) * PAGE_SIZE
+        end_idx = min(start_idx + PAGE_SIZE, len(st.session_state.all_docs))
+
+        for i in range(start_idx, end_idx):
+            doc = st.session_state.all_docs[i]
+            with st.expander(f"📄 片段 {i + 1}", expanded=False):
+                st.markdown(f"**来源**: `{doc.metadata.get('source', '未知')}`")
+                st.markdown(f"**页码**: {doc.metadata.get('page', '未知')}")
+                st.markdown("**内容预览**:")
+                st.text(doc.page_content[:150] + ("..." if len(doc.page_content) > 150 else ""))
+                if st.checkbox("显示完整内容", key=f"full_{i}"):
+                    st.text_area("内容", doc.page_content, height=200, key=f"content_{i}", label_visibility="collapsed")
+
+
+# ==================== 主界面 ====================
+def main_interface():
+    """主界面功能"""
+    st.title("🧠 RAG 知识问答系统")
+    st.caption("Powered by DeepSeek & LangChain")
+
+    # 检索设置
+    with st.expander("⚙️ 检索配置", expanded=False):
         col1, col2 = st.columns(2)
         with col1:
-            chunk_size = st.number_input("分块大小", min_value=100, max_value=2000, value=800)
+            st.selectbox(
+                "检索模式",
+                ["混合检索", "仅向量检索", "仅关键字检索(BM25)"],
+                key="retrieval_mode"
+            )
         with col2:
-            chunk_overlap = st.number_input("分块重叠", min_value=0, max_value=500, value=100)
-    
-    # 操作按钮
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("上传并处理", key="upload_process_btn"):
-            if uploaded_files:
-                # 保存文件
-                save_dir = st.session_state.pdf_processor.pdf_folder
-                filepaths = save_uploaded_files(uploaded_files, save_dir)
-                
-                if filepaths:
-                    # 处理文件
-                    st.session_state.pdf_processing = True
-                    with st.spinner("正在处理PDF文件..."):
-                        try:
-                            result = st.session_state.pdf_processor.process_all_pdfs(
-                                chunk_size=chunk_size,
-                                chunk_overlap=chunk_overlap
-                            )
-                            
-                            # 显示结果
-                            st.success("处理完成!")
-                            st.json({
-                                "总文件数": result["total"],
-                                "成功处理": result["processed"],
-                                "跳过重复": result["skipped"],
-                                "处理失败": result["failed"]
-                            })
-                            
-                            # 显示详情
-                            for detail in result["details"]:
-                                if detail["status"] == "success":
-                                    st.success(f"{detail['file']}: 成功 ({detail['chunks']}块)")
-                                elif detail["status"] == "skipped":
-                                    st.warning(f"{detail['file']}: 跳过 - {detail['message']}")
-                                elif detail["status"] == "failed":
-                                    st.error(f"{detail['file']}: 失败 - {detail['message']}")
-                        
-                        except Exception as e:
-                            st.error(f"处理失败: {str(e)}")
-                        finally:
-                            st.session_state.pdf_processing = False
-                else:
-                    st.warning("文件保存失败")
-            else:
-                st.warning("请先上传PDF文件")
-    
-    with col2:
-        if st.button("清除知识库", key="clear_knowledge_btn"):
-            try:
-                st.session_state.pdf_processor.client.reset()
-                shutil.rmtree(st.session_state.pdf_processor.pdf_folder, ignore_errors=True)
-                shutil.rmtree(st.session_state.pdf_processor.processed_dir, ignore_errors=True)
-                st.success("知识库已清除")
-            except Exception as e:
-                st.error(f"清除失败: {str(e)}")
-    
-    st.divider()
-    
-    # ==================== 知识库状态 ====================
-    st.subheader("知识库状态")
-    try:
-        collection = st.session_state.pdf_processor.client.get_collection(
-            name="bge_m3_docs",
-            embedding_function=st.session_state.pdf_processor.embedding_function
+            st.slider(
+                "向量权重",
+                0.0, 1.0, DEFAULT_VECTOR_WEIGHT,
+                key="vector_weight"
+            )
+
+    # 文件上传
+    with st.expander("📤 上传文档", expanded=False):
+        uploaded_file = st.file_uploader(
+            "选择PDF文件",
+            type=["pdf"],
+            label_visibility="collapsed"
         )
-        st.metric("文档数量", collection.count())
-        
-        if collection.count() > 0:
-            with st.expander("查看文档列表"):
-                unique_files = set()
-                results = collection.get(include=["metadatas"])
-                for meta in results["metadatas"]:
-                    unique_files.add(meta["source_file"])
-                
-                for file in sorted(unique_files):
-                    st.text(f"📄 {file}")
-    except Exception as e:
-        st.warning("知识库未初始化")
-    
+        if uploaded_file is not None:
+            with st.spinner("正在处理文档..."):
+                process_pdf_file(uploaded_file)
+
+    # 问答区域
     st.divider()
-    
-    # ==================== 设置 ====================
-    st.header("设置")
-    model_name = st.selectbox(
-        "选择模型",
-        options=["deepseek-chat", "deepseek-reasoner"],
-        index=0
+    question = st.text_input(
+        "💡 请输入您的问题：",
+        placeholder="输入问题后按回车查询",
+        key="question_input"
     )
-    temperature = st.slider("Temperature", min_value=0.0, max_value=1.0, value=0.7, step=0.1)
-    
-    st.divider()
 
-# ==================== 主聊天界面 ====================
-chat_container = st.container()
+    if question:
+        # 检查是否需要重新生成回答
+        if ("last_question" not in st.session_state or
+                st.session_state.last_question != question or
+                "last_answer" not in st.session_state):
 
-with chat_container:
-    if st.session_state.current_chat_id in st.session_state.chats:
-        current_chat = st.session_state.chats[st.session_state.current_chat_id]
-        st.subheader(current_chat["title"])
-        
-        # 显示聊天历史
-        for message in current_chat["messages"]:
-            if isinstance(message, dict) and "role" in message and "content" in message:
-                with st.chat_message(message["role"]):
-                    st.markdown(message["content"])
-    else:
-        st.warning("当前聊天无效，已创建新聊天")
-        create_new_chat()
-        st.rerun()
+            with st.spinner("正在检索知识库并生成回答..."):
+                try:
+                    # 获取上下文
+                    retriever = get_retriever()
+                    docs = retriever.invoke(question)
 
-# ==================== 用户输入 ====================
-input_container = st.container()
-with input_container:
-    col1, col2 = st.columns([6, 1])
-    with col1:
-        st.text_area("输入您的问题...", key="user_input_area", height=100, label_visibility="collapsed")
-    with col2:
-        st.write("")
-        st.write("")
-        st.button("发送", key="send_button", on_click=handle_send, use_container_width=True)
+                    # 生成回答 - 这里直接传递问题字符串，而不是字典
+                    answer = rag_chain.invoke(question)
 
-# 处理消息发送
-if st.session_state.get("message_sent", False):
-    # 获取用户输入
-    user_input = st.session_state.user_input_text
-    
-    # 重置标志
-    st.session_state.message_sent = False
-    
-    # 显示用户消息
-    current_chat = st.session_state.chats[st.session_state.current_chat_id]
-    with st.chat_message("user"):
-        st.markdown(user_input)
-    
-    # 添加到聊天记录
-    current_chat["messages"].append({"role": "user", "content": user_input})
-    
-    # 生成AI响应
-    generate_ai_response(model_name=model_name, temperature=temperature)
-    
-    st.rerun()
+                    # 存储结果
+                    st.session_state.last_question = question
+                    st.session_state.last_answer = answer
+                    st.session_state.last_context = docs
+                except Exception as e:
+                    st.error(f"生成回答时出错: {str(e)}")
+                    return
 
-# 页脚
-st.markdown("---")
-st.caption("© 2025 RAG智能问答系统")
+        # 显示回答
+        st.markdown("### 回答")
+        st.write(st.session_state.last_answer)
+
+        # 显示上下文（不需要重新计算）
+        if st.checkbox("显示相关上下文", key="show_context"):
+            st.markdown("### 相关上下文")
+            for i, doc in enumerate(st.session_state.last_context, 1):
+                st.markdown(f"#### 上下文 {i}")
+                st.markdown(f"**来源**: `{doc.metadata.get('source', '未知')}`")
+                st.markdown(f"**页码**: {doc.metadata.get('page', '未知')}")
+                st.text(doc.page_content)
+
+
+# ==================== 应用入口 ====================
+if __name__ == "__main__":
+    # 确保session state已初始化
+    initialize_session_state()
+
+    # 加载界面
+    knowledge_base_sidebar()
+    main_interface()

@@ -1,10 +1,11 @@
 # edu-rag-qa-system
 基于RAG的教育场景智能问答系统
 
-```Python = 3.9```
 
 安装依赖
-```pip install -r requirements.txt
+```
+pip install -r requirements.txt
+
 ```
 
 
